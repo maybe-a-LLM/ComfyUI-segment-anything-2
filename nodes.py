@@ -14,6 +14,10 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 import folder_paths
 
+from PIL import Image
+import cv2 as cv
+
+
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 class DownloadAndLoadSAM2Model:
@@ -421,6 +425,296 @@ class Sam2Segmentation:
         mask_tensor = torch.stack(out_list, dim=0).cpu().float()
         return (mask_tensor,)
 
+def bbox_corners_to_yolo(x_min, y_min, x_max, y_max, img_width, img_height):
+    """
+    Convert bounding box from corners format to YOLO format.
+
+    Parameters:
+    x_min, y_min, x_max, y_max (float): Coordinates of the bounding box in corners format.
+    img_width, img_height (int): Dimensions of the image.
+
+    Returns:
+    tuple: Bounding box in YOLO format (x_center, y_center, width, height).
+    """
+    # Calculate the center of the bounding box
+    x_center = (x_min + x_max) / 2.0
+    y_center = (y_min + y_max) / 2.0
+
+    # Calculate the width and height of the bounding box
+    width = x_max - x_min
+    height = y_max - y_min
+
+    # Normalize the coordinates
+    x_center /= img_width
+    y_center /= img_height
+    width /= img_width
+    height /= img_height
+
+    return x_center, y_center, width, height
+
+def bbox_yolo_to_corners(x_center, y_center, width, height, img_width, img_height):
+    """
+    Convert bounding box from YOLO format to corners format.
+
+    Parameters:
+    x_center, y_center, width, height (float): Coordinates of the bounding box in YOLO format (normalized).
+    img_width, img_height (int): Dimensions of the image.
+
+    Returns:
+    tuple: Bounding box in corners format (x_min, y_min, x_max, y_max).
+    """
+    # Denormalize the coordinates
+    x_center *= img_width
+    y_center *= img_height
+    width *= img_width
+    height *= img_height
+
+    # Calculate the corners of the bounding box
+    x_min = x_center - (width / 2.0)
+    y_min = y_center - (height / 2.0)
+    x_max = x_center + (width / 2.0)
+    y_max = y_center + (height / 2.0)
+
+    return int(x_min), int(y_min), int(x_max), int(y_max)
+
+class Sam2SegmentationSeq:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "image": ("IMAGE",),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "bboxes": ("BBOX",),
+                "individual_objects": ("BOOLEAN", {"default": False}),
+                "mask": ("MASK",),
+                "alpha": ("INT", {"default": 0, "min": 0, "max": 100}),
+                # How much to expand the area of interest
+                "kernel_size": ("INT", {"default": 3, "min": 1, "max": 27}),
+                # kernel size for dilation and erosion
+                "erode": ("BOOLEAN", {"default": False}),
+                "dilate": ("BOOLEAN", {"default": False}),
+                "iterations": ("INT", {"default": 1, "min": 1, "max": 20}),
+                # number of iterations for dilation and erosion
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(
+        self,
+        image,
+        sam2_model,
+        keep_model_loaded,
+        individual_objects=False,
+        bboxes=None,
+        mask=None,
+        alpha=0,
+        kernel_size=3,
+        erode=False,
+        dilate=False,
+        iterations=1,
+    ):
+        """
+        Segment an image using the SAM2 model.
+
+        Why Seq?
+        It Crops the image for each bounding box and maybe expand it by a percentage of the image size before segmenting.
+        return a mask of all segmented areas
+        """
+
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+        B, H, W, C = image.shape
+
+        if mask is not None:
+            input_mask = mask.clone().unsqueeze(1)
+            input_mask = F.interpolate(input_mask, size=(256, 256), mode="bilinear")
+            input_mask = input_mask.squeeze(1)
+
+        if segmentor == "automaskgenerator":
+            raise ValueError("For automaskgenerator use Sam2AutoMaskSegmentation -node")
+        if segmentor == "single_image" and B > 1:
+            print("Segmenting batch of images with single_image segmentor")
+
+        if segmentor == "video":
+            raise ValueError("not implemented")
+
+        mask_list = []
+        masks = []
+        batch_masks = []
+        try:
+            model.to(device)
+        except:
+            model.model.to(device)
+
+        autocast_condition = not mm.is_device_mps(device)
+        with (
+            torch.autocast(mm.get_autocast_device(device), dtype=dtype)
+            if autocast_condition
+            else nullcontext()
+        ):
+            if segmentor == "single_image":
+                # <BHWC>
+                image_np = (image.contiguous() * 255).byte().numpy()
+                comfy_pbar = ProgressBar(len(image_np))
+                tqdm_pbar = tqdm(total=len(image_np), desc="Processing Images")
+
+                for img_index, img in enumerate(image_np):
+                    width = img.shape[1]
+                    height = img.shape[0]
+                    img_area = width * height
+
+                    for bbox_index, bbox in enumerate(bboxes[0]):
+                        x1, y1, x2, y2 = [int(_) for _ in bbox]
+                        bbox_area = (x2 - x1) * (y2 - y1)
+
+                        x, y, w, h = bbox_corners_to_yolo(x1, y1, x2, y2, width, height)
+
+                        if bbox_area / img_area > 0.35:
+                            print("Using whole image")
+                            img_pos = img
+                            x1_pos, y1_pos, x2_pos, y2_pos = x1, y1, x2, y2
+                            x1_img, y1_img, x2_img, y2_img = 0, 0, width, height
+                        else:
+                            # Cropping to a dimension equal to the bbox + a proportional part of the image size
+                            if alpha != 0:
+
+                                print("Expanding bbox")
+
+                                y1_img = max(
+                                    0,
+                                    y1 - (int(height * (alpha / 100))),
+                                )
+                                y2_img = min(
+                                    height,
+                                    y2 + (int(height * (alpha / 100))),
+                                )
+                                x1_img = max(
+                                    0,
+                                    x1 - (int(width * (alpha / 100))),
+                                )
+                                x2_img = min(
+                                    width,
+                                    x2 + (int(width * (alpha / 100))),
+                                )
+                            else:
+                                y1_img = y1
+                                y2_img = y2
+                                x1_img = x1
+                                x2_img = x2
+
+                            img_pos = img[y1_img:y2_img, x1_img:x2_img]
+                            x1_pos = x1 - x1_img
+                            y1_pos = y1 - y1_img
+                            x2_pos = x2 - x1_img
+                            y2_pos = y2 - y1_img
+
+                        bbox_pos = [[x1_pos, y1_pos, x2_pos, y2_pos]]
+
+                        ############
+                        # debug
+                        # random_caractere_string = "".join(
+                        #     random.choices("abcdefghijklmnopqrstuvwxyz", k=5)
+                        # )
+
+                        # img_pos_temp = img_pos.copy()
+                        # img_pos_temp = cv.rectangle(
+                        #     img_pos_temp,
+                        #     (x1_pos, y1_pos),
+                        #     (x2_pos, y2_pos),
+                        #     (255, 0, 0),
+                        #     2,
+                        # )
+                        # Image.fromarray(img_pos_temp).save(
+                        #     f"{random_caractere_string}_{img_index}_{bbox_index}.png"
+                        # )
+                        ############
+
+                        model.set_image(img_pos)
+
+                        out_masks, scores, logits = model.predict(
+                            point_coords=(None),
+                            point_labels=(None),
+                            box=bbox_pos,
+                            multimask_output=True if not individual_objects else False,
+                            mask_input=(None),
+                        )
+
+                        if out_masks.ndim == 3:
+                            sorted_ind = np.argsort(scores)[::-1]
+                            out_masks = out_masks[sorted_ind][
+                                0
+                            ]  # choose only the best result for now
+                            scores = scores[sorted_ind]
+                            logits = logits[sorted_ind]
+                            mask_list.append(np.expand_dims(out_masks, axis=0))
+                        else:
+                            _, _, H, W = out_masks.shape
+                            # Combine masks for all object IDs in the frame
+                            combined_mask = np.zeros((H, W), dtype=bool)
+                            for out_mask in out_masks:
+                                combined_mask = np.logical_or(combined_mask, out_mask)
+                            combined_mask = combined_mask.astype(np.uint8)
+                            mask_list.append(combined_mask)
+
+                        # convert the mask back to the original image size
+
+                        parcial_mask = np.zeros_like(img)
+                        parcial_mask[y1_img:y2_img, x1_img:x2_img] = np.stack(
+                            (mask_list[-1][0], mask_list[-1][0], mask_list[-1][0]),
+                            axis=-1,
+                        )
+                        masks.append(parcial_mask)
+                        comfy_pbar.update(1)
+                        tqdm_pbar.update(1)
+
+                # end
+                batch_masks.append(masks)
+
+            elif segmentor == "video":
+                raise ValueError("not implemented")
+
+        if not keep_model_loaded:
+            try:
+                model.to(offload_device)
+            except:
+                model.model.to(offload_device)
+
+        out_list = []
+        # final_mask: (870, 595, 3) <HWC>
+        for mask in batch_masks[0]:
+
+            kernel = np.ones((kernel_size, kernel_size), np.uint8)
+
+            if dilate:
+                mask = cv.dilate(mask, kernel, iterations=iterations)
+
+            if erode:
+                mask = cv.erode(mask, kernel, iterations=iterations)
+
+            mask_tensor = torch.from_numpy(mask)
+            mask_tensor = mask_tensor[:, :, 0]  # <HW1>
+            out_list.append(mask_tensor)
+
+        # use all masks to create a unique mask
+
+        if out_list == []:
+            out_list.append(torch.zeros((height, width)))
+
+        mask_tensor = torch.stack(out_list, dim=0).cpu().float()
+
+        # Torch.tensor<BHWC>
+        return (mask_tensor.any(dim=0, keepdim=True).float(),)
+
 class Sam2VideoSegmentationAddPoints:
     @classmethod
     def IS_CHANGED(s): # TODO: smarter reset?
@@ -752,16 +1046,18 @@ class Sam2AutoSegmentation:
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadSAM2Model": DownloadAndLoadSAM2Model,
     "Sam2Segmentation": Sam2Segmentation,
+    "Sam2SegmentationSeq": Sam2SegmentationSeq,
     "Florence2toCoordinates": Florence2toCoordinates,
     "Sam2AutoSegmentation": Sam2AutoSegmentation,
     "Sam2VideoSegmentationAddPoints": Sam2VideoSegmentationAddPoints,
-    "Sam2VideoSegmentation": Sam2VideoSegmentation
+    "Sam2VideoSegmentation": Sam2VideoSegmentation,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadSAM2Model": "(Down)Load SAM2Model",
     "Sam2Segmentation": "Sam2Segmentation",
+    "Sam2SegmentationSeq": "Sam2SegmentationSeq",
     "Florence2toCoordinates": "Florence2 Coordinates",
     "Sam2AutoSegmentation": "Sam2AutoSegmentation",
     "Sam2VideoSegmentationAddPoints": "Sam2VideoSegmentationAddPoints",
-    "Sam2VideoSegmentation": "Sam2VideoSegmentation"
+    "Sam2VideoSegmentation": "Sam2VideoSegmentation",
 }
